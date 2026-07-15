@@ -194,8 +194,8 @@ def sanitize_error_message(raw: Optional[str]) -> str:
     """Normalize a free-form ``error_message`` into a bounded label value.
 
     This is the single source of truth for the ``error_message`` label on
-    :data:`REMEDIATION_DURATION_BY_MESSAGE` and :data:`TIME_TO_TICKET`. Every
-    call site MUST route the raw alert value through here (mirroring how
+    :data:`REMEDIATION_DURATION_BY_MESSAGE`. Every call site MUST route the
+    raw alert value through here (mirroring how
     ``attempts`` goes through :func:`bucket_attempts`) so a per-instance alert
     payload can never create one Prometheus series per occurrence.
 
@@ -376,20 +376,6 @@ REMEDIATION_DURATION_BY_MESSAGE = Histogram(
     "counter (grouped by ``outcome``), so no separate counter is needed.",
     ["alert_type", "error_message", "outcome"],
     buckets=_REMEDIATION_DURATION_BUCKETS,
-)
-
-TIME_TO_TICKET = Histogram(
-    "hermes_time_to_ticket_seconds",
-    "Time from workflow start (alert received / job triggered) until the "
-    "downstream automation reports a ``jira_ticket_id`` back to Hermes via the "
-    "Rundeck execution options. Observed once per workflow, the first time the "
-    "ticket id transitions from unset to set. The ``error_message`` label MUST "
-    "come from ``sanitize_error_message`` to stay bounded; its ``_count`` child "
-    "is how many alerts produced a ticket, which — contrasted with "
-    "``outcome=\"success\"`` on ``REMEDIATION_DURATION_BY_MESSAGE`` — gives the "
-    "resolved-vs-ticketed split.",
-    ["alert_type", "error_message"],
-    buckets=(30, 60, 120, 300, 600, 1800, 3600),
 )
 
 JOB_EXECUTION_DURATION = Histogram(
@@ -618,7 +604,6 @@ __all__ = [
     "ResolutionSource",
     "SLACK_NOTIFICATIONS",
     "SlackNotificationType",
-    "TIME_TO_TICKET",
     "WORKFLOW_RECOVERY",
     "WorkflowRecoveryOutcome",
     "bucket_attempts",

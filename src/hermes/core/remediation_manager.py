@@ -26,6 +26,7 @@ from hermes.clients.jira import JiraClient
 from hermes.clients.slack import SlackClient
 from hermes.utils import metrics
 from hermes.utils.metrics import (
+    ERROR_MESSAGE_NONE,
     BurstSuppressionPhase,
     ExternalService,
     JiraOperation,
@@ -34,6 +35,7 @@ from hermes.utils.metrics import (
     SlackNotificationType,
     WorkflowRecoveryOutcome,
     bucket_attempts,
+    sanitize_error_message,
 )
 
 
@@ -97,12 +99,17 @@ class _WorkflowFallback:
 
     All fields use the same closed-set semantics as the regular path:
     ``alert_name`` is bounded by ``config.yaml``; ``attempts`` is bounded
-    by ``remediation.max_attempts``.
+    by ``remediation.max_attempts``; ``error_message`` is bounded because it
+    is stored pre-normalized through ``sanitize_error_message`` (defaulting
+    to ``"none"`` when the alert carried no ``error_message`` label), so the
+    state-store-down path emits the same ``error_message`` label the regular
+    path would have.
     """
 
     alert_name: str
     created_at: datetime
     attempts: int = 1
+    error_message: str = ERROR_MESSAGE_NONE
 
 
 class RemediationManager:
@@ -535,6 +542,7 @@ class RemediationManager:
             created_at=workflow.created_at,
             attempts=workflow.attempts or 1,
             outcome=outcome,
+            error_message=workflow.alert_labels.get("error_message"),
         )
 
     def _record_terminal_from_fallback(
@@ -566,6 +574,7 @@ class RemediationManager:
             created_at=fallback.created_at,
             attempts=fallback.attempts,
             outcome=outcome,
+            error_message=fallback.error_message,
         )
         return True
 
@@ -577,13 +586,22 @@ class RemediationManager:
         created_at: datetime,
         attempts: int,
         outcome: str,
+        error_message: Optional[str],
     ) -> None:
         """Idempotent terminal metric emission shared by both call paths.
 
         Internal helper: callers should use :meth:`_record_terminal` (regular
         path) or :meth:`_record_terminal_from_fallback` (state-store-down
         path), which know how to source ``alert_name`` / ``created_at`` /
-        ``attempts`` and which arguments come from a closed set.
+        ``attempts`` / ``error_message`` and which arguments come from a
+        closed set.
+
+        ``error_message`` is the raw alert value (or the pre-normalized
+        fallback value) and is routed through :func:`sanitize_error_message`
+        here — the single guard for the ``error_message`` label, mirroring how
+        ``attempts`` goes through :func:`bucket_attempts`. Sanitization is
+        idempotent, so the already-normalized value from
+        :meth:`_record_terminal_from_fallback` passes through unchanged.
         """
         if workflow_id in self._terminal_recorded:
             logger.debug(
@@ -596,6 +614,14 @@ class RemediationManager:
             duration = (datetime.utcnow() - created_at).total_seconds()
             metrics.REMEDIATION_DURATION.labels(
                 alert_type=alert_name,
+                outcome=outcome,
+            ).observe(duration)
+            # Same lifecycle duration, additionally sliced by a bounded
+            # error_message. Its _count child doubles as the per-error_message
+            # resolved/escalated counter, so no separate counter is needed.
+            metrics.REMEDIATION_DURATION_BY_MESSAGE.labels(
+                alert_type=alert_name,
+                error_message=sanitize_error_message(error_message),
                 outcome=outcome,
             ).observe(duration)
         except Exception as e:  # noqa: BLE001
@@ -663,6 +689,7 @@ class RemediationManager:
             alert_name=alert_name,
             created_at=workflow.created_at,
             attempts=workflow.attempts or 1,
+            error_message=sanitize_error_message(alert_labels.get("error_message")),
         )
 
         # Start background monitoring task
@@ -1310,6 +1337,9 @@ class RemediationManager:
                         alert_name=workflow.alert_name,
                         created_at=workflow.created_at,
                         attempts=workflow.attempts or 1,
+                        error_message=sanitize_error_message(
+                            workflow.alert_labels.get("error_message")
+                        ),
                     )
 
                     # Start monitoring task
