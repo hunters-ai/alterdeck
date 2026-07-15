@@ -185,7 +185,10 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 _IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
-_MIXED_ALNUM_RE = re.compile(r"\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]+\b")
+_MIN_OPAQUE_ID_LENGTH = 12
+_OPAQUE_ID_RE = re.compile(
+    r"\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{%d,}\b" % _MIN_OPAQUE_ID_LENGTH
+)
 _NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -204,17 +207,13 @@ def sanitize_error_message(raw: Optional[str]) -> str:
     1. ``None`` / empty / whitespace-only -> :data:`ERROR_MESSAGE_NONE`
        (``"none"``) so the label always has a value.
     2. Lower-case, so ``"Timeout"`` and ``"timeout"`` share a series.
-    3. Fold per-instance tokens to fixed placeholders:
-       UUIDs -> ``<uuid>``, IPv4 addresses -> ``<ip>``, mixed
-       letter+digit identifiers (org codes, dataflow ids, object ids,
-       shas, versions) -> ``<id>``, and bare integers / decimals ->
-       ``<num>``.
+    3. Fold high-cardinality per-instance tokens to fixed placeholders:
+       UUIDs -> ``<uuid>``, IPv4 addresses -> ``<ip>``, long opaque
+       alphanumeric identifiers (``>= _MIN_OPAQUE_ID_LENGTH`` chars mixing
+       letters and digits, e.g. hashes / dashless UUIDs / object ids) ->
+       ``<id>``, and bare integers / decimals -> ``<num>``.
     4. Collapse runs of whitespace to a single space.
     5. Truncate to :data:`_MAX_ERROR_MESSAGE_LENGTH` characters.
-
-    Purely alphabetic tokens are preserved (we cannot distinguish a volatile
-    all-letters org code from a real word without false positives), so the
-    label is *practically* bounded rather than bounded by construction.
 
     Examples::
 
@@ -235,7 +234,7 @@ def sanitize_error_message(raw: Optional[str]) -> str:
     text = text.lower()
     text = _UUID_RE.sub("<uuid>", text)
     text = _IPV4_RE.sub("<ip>", text)
-    text = _MIXED_ALNUM_RE.sub("<id>", text)
+    text = _OPAQUE_ID_RE.sub("<id>", text)
     text = _NUMBER_RE.sub("<num>", text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
 
