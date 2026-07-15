@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from typing import AsyncIterator, Iterable, Optional
 
@@ -173,6 +174,77 @@ def bucket_attempts(attempts: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# error_message label sanitization
+# ---------------------------------------------------------------------------
+
+ERROR_MESSAGE_NONE = "none"
+_MAX_ERROR_MESSAGE_LENGTH = 80
+
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_MIN_OPAQUE_ID_LENGTH = 12
+_OPAQUE_ID_RE = re.compile(
+    r"\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{%d,}\b" % _MIN_OPAQUE_ID_LENGTH
+)
+_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def sanitize_error_message(raw: Optional[str]) -> str:
+    """Normalize a free-form ``error_message`` into a bounded label value.
+
+    This is the single source of truth for the ``error_message`` label on
+    :data:`REMEDIATION_DURATION_BY_MESSAGE`. Every call site MUST route the
+    raw alert value through here (mirroring how
+    ``attempts`` goes through :func:`bucket_attempts`) so a per-instance alert
+    payload can never create one Prometheus series per occurrence.
+
+    Normalization, in order:
+
+    1. ``None`` / empty / whitespace-only -> :data:`ERROR_MESSAGE_NONE`
+       (``"none"``) so the label always has a value.
+    2. Lower-case, so ``"Timeout"`` and ``"timeout"`` share a series.
+    3. Fold high-cardinality per-instance tokens to fixed placeholders:
+       UUIDs -> ``<uuid>``, IPv4 addresses -> ``<ip>``, long opaque
+       alphanumeric identifiers (``>= _MIN_OPAQUE_ID_LENGTH`` chars mixing
+       letters and digits, e.g. hashes / dashless UUIDs / object ids) ->
+       ``<id>``, and bare integers / decimals -> ``<num>``.
+    4. Collapse runs of whitespace to a single space.
+    5. Truncate to :data:`_MAX_ERROR_MESSAGE_LENGTH` characters.
+
+    Examples::
+
+        >>> sanitize_error_message("Active-dataflow-is-not-running-or-failed")
+        'active-dataflow-is-not-running-or-failed'
+        >>> sanitize_error_message("Dataflow df-12345 on 10.0.0.5 timed out")
+        'dataflow df-<num> on <ip> timed out'
+        >>> sanitize_error_message(None)
+        'none'
+    """
+    if raw is None:
+        return ERROR_MESSAGE_NONE
+    text = raw if isinstance(raw, str) else str(raw)
+    text = text.strip()
+    if not text:
+        return ERROR_MESSAGE_NONE
+
+    text = text.lower()
+    text = _UUID_RE.sub("<uuid>", text)
+    text = _IPV4_RE.sub("<ip>", text)
+    text = _OPAQUE_ID_RE.sub("<id>", text)
+    text = _NUMBER_RE.sub("<num>", text)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+
+    if len(text) > _MAX_ERROR_MESSAGE_LENGTH:
+        text = text[:_MAX_ERROR_MESSAGE_LENGTH].strip()
+
+    return text or ERROR_MESSAGE_NONE
+
+
+# ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
 INCOMING_REQUESTS = Counter(
@@ -285,11 +357,24 @@ ACTIVE_WORKFLOWS = Gauge(
     "Current number of in-flight remediation workflows.",
 )
 
+_REMEDIATION_DURATION_BUCKETS = (60, 300, 600, 1800, 3600, 7200, 14400)
+
 REMEDIATION_DURATION = Histogram(
     "hermes_remediation_duration_seconds",
     "Workflow lifecycle duration from creation to terminal state.",
     ["alert_type", "outcome"],
-    buckets=(60, 300, 600, 1800, 3600, 7200, 14400),
+    buckets=_REMEDIATION_DURATION_BUCKETS,
+)
+
+REMEDIATION_DURATION_BY_MESSAGE = Histogram(
+    "hermes_remediation_duration_by_message_seconds",
+    "Workflow lifecycle duration, additionally sliced by a bounded "
+    "``error_message`` label. The ``error_message`` value MUST come from "
+    "``sanitize_error_message`` — never pass a raw alert label value. Its "
+    "``_count`` child doubles as the per-error_message resolved/escalated "
+    "counter (grouped by ``outcome``), so no separate counter is needed.",
+    ["alert_type", "error_message", "outcome"],
+    buckets=_REMEDIATION_DURATION_BUCKETS,
 )
 
 JOB_EXECUTION_DURATION = Histogram(
@@ -494,6 +579,7 @@ __all__ = [
     "CIRCUIT_BREAKER_STATE",
     "CIRCUIT_BREAKER_TRIPS",
     "CONCURRENCY_LIMIT_HIT",
+    "ERROR_MESSAGE_NONE",
     "ESCALATIONS_SENT",
     "EXTERNAL_CALL_DURATION",
     "EXTERNAL_CALL_ERRORS",
@@ -507,6 +593,7 @@ __all__ = [
     "PROCESSING_ERRORS",
     "RATE_LIMITED_REQUESTS",
     "REMEDIATION_DURATION",
+    "REMEDIATION_DURATION_BY_MESSAGE",
     "REMEDIATION_OUTCOMES",
     "REMEDIATION_RETRIES",
     "REMEDIATION_WORKFLOWS",
@@ -521,6 +608,7 @@ __all__ = [
     "bucket_attempts",
     "init_circuit_breaker_states",
     "reset_for_tests",
+    "sanitize_error_message",
     "set_active_workflow_count",
     "set_build_info",
     "set_circuit_breaker_state",
