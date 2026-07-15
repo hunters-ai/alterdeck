@@ -495,6 +495,7 @@ class RemediationManager:
         alert_name: str,
         outcome: str,
         attempts: int,
+        error_message: Optional[str] = None,
     ) -> None:
         """
         Record remediation outcome metric (closed-set ``outcome``).
@@ -511,12 +512,19 @@ class RemediationManager:
         config model has no upper bound). ``attempts="1"`` is preserved
         exactly so the SLO dashboards' first-attempt success rate query
         keeps working.
+
+        ``error_message`` is routed through :func:`sanitize_error_message`
+        (defaulting to ``None`` -> ``"none"``) -- the same bounded label used
+        on :data:`REMEDIATION_DURATION_BY_MESSAGE` -- so the counter can be
+        sliced per error_message (e.g. runs-before-ticket) without ever
+        creating a series per alert instance.
         """
         try:
             metrics.REMEDIATION_OUTCOMES.labels(
                 alert_type=alert_name,
                 outcome=outcome,
                 attempts=bucket_attempts(attempts),
+                error_message=sanitize_error_message(error_message),
             ).inc()
         except Exception as e:  # noqa: BLE001 - metrics never break workflows
             logger.warning(f"Failed to record outcome metric: {e}")
@@ -609,7 +617,9 @@ class RemediationManager:
                 f"skipping outcome={outcome}"
             )
             return
-        self._record_outcome(alert_name, outcome, attempts=attempts)
+        self._record_outcome(
+            alert_name, outcome, attempts=attempts, error_message=error_message
+        )
         try:
             duration = (datetime.utcnow() - created_at).total_seconds()
             metrics.REMEDIATION_DURATION.labels(

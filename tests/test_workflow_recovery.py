@@ -10,9 +10,17 @@ from hermes.core.state_store import InMemoryStateStore, RemediationWorkflow, Rem
 from hermes.utils import metrics as m
 
 
-def _outcomes_count(alert_type: str, outcome: str, attempts: str) -> float:
+def _outcomes_count(
+    alert_type: str,
+    outcome: str,
+    attempts: str,
+    error_message: str = m.ERROR_MESSAGE_NONE,
+) -> float:
     return m.REMEDIATION_OUTCOMES.labels(
-        alert_type=alert_type, outcome=outcome, attempts=attempts
+        alert_type=alert_type,
+        outcome=outcome,
+        attempts=attempts,
+        error_message=error_message,
     )._value.get()  # type: ignore[attr-defined]
 
 

@@ -323,12 +323,17 @@ REMEDIATION_WORKFLOWS = Counter(
 
 REMEDIATION_OUTCOMES = Counter(
     "hermes_remediation_outcomes_total",
-    "Remediation outcomes by alert type, outcome, and number of attempts at "
-    "terminal time. ``attempts`` is bucketed via ``AttemptBucket`` "
-    "(``\"1\"``, ``\"2\"``, ``\"3\"``, ``\"4+\"``) so cardinality stays bounded "
-    "regardless of ``max_attempts`` config overrides; ``attempts=\"1\"`` "
-    "still gives you first-attempt success rate exactly.",
-    ["alert_type", "outcome", "attempts"],
+    "Remediation outcomes by alert type, outcome, number of attempts at "
+    "terminal time, and a bounded ``error_message``. ``attempts`` is bucketed "
+    "via ``AttemptBucket`` (``\"1\"``, ``\"2\"``, ``\"3\"``, ``\"4+\"``) so "
+    "cardinality stays bounded regardless of ``max_attempts`` config "
+    "overrides; ``attempts=\"1\"`` still gives you first-attempt success rate "
+    "exactly. ``error_message`` MUST come from ``sanitize_error_message`` (the "
+    "same bounded label as on ``REMEDIATION_DURATION_BY_MESSAGE``) so it can "
+    "never create one series per alert instance; filtering to non-``success`` "
+    "outcomes then gives runs-before-ticket (the ``attempts`` distribution) "
+    "sliced per error_message.",
+    ["alert_type", "outcome", "attempts", "error_message"],
 )
 
 REMEDIATION_RETRIES = Counter(

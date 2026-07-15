@@ -95,6 +95,24 @@ def _counter_value(counter, **labels) -> float:
     return sample._value.get()  # type: ignore[attr-defined]
 
 
+def _outcome_value(
+    alert_type: str,
+    outcome: str,
+    attempts: str,
+    error_message: str = m.ERROR_MESSAGE_NONE,
+) -> float:
+    """Read a ``REMEDIATION_OUTCOMES`` sample. ``error_message`` defaults to the
+    ``"none"`` series that workflows without an ``error_message`` label (and
+    direct ``_record_outcome`` calls) land on."""
+    return _counter_value(
+        m.REMEDIATION_OUTCOMES,
+        alert_type=alert_type,
+        outcome=outcome,
+        attempts=attempts,
+        error_message=error_message,
+    )
+
+
 def _make_manager() -> RemediationManager:
     config = MagicMock(spec=Config)
     config.remediation = RemediationConfig()
@@ -108,21 +126,11 @@ def _make_manager() -> RemediationManager:
 class TestOutcomeRecording:
     def test_record_outcome_increments_counter(self):
         manager = _make_manager()
-        before = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="UnitTestAlert",
-            outcome="success",
-            attempts="1",
-        )
+        before = _outcome_value("UnitTestAlert", "success", "1")
 
         manager._record_outcome("UnitTestAlert", "success", attempts=1)
 
-        after = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="UnitTestAlert",
-            outcome="success",
-            attempts="1",
-        )
+        after = _outcome_value("UnitTestAlert", "success", "1")
         assert after == before + 1
 
     def test_record_outcome_swallows_metric_failure(self, monkeypatch):
@@ -170,22 +178,12 @@ class TestOutcomeRecording:
         """
         manager = _make_manager()
         # ``42`` and ``99`` should both fold into the same ``"4+"`` series.
-        before = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="BucketAlert",
-            outcome="success",
-            attempts="4+",
-        )
+        before = _outcome_value("BucketAlert", "success", "4+")
 
         manager._record_outcome("BucketAlert", "success", attempts=42)
         manager._record_outcome("BucketAlert", "success", attempts=99)
 
-        after = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="BucketAlert",
-            outcome="success",
-            attempts="4+",
-        )
+        after = _outcome_value("BucketAlert", "success", "4+")
         assert after == before + 2, (
             "Both high-attempt observations should land in the '4+' bucket; "
             "if this fails the call site is bypassing `bucket_attempts` and "
@@ -194,12 +192,7 @@ class TestOutcomeRecording:
 
         # And confirm no per-integer series were created.
         for n in (42, 99):
-            integer_series = _counter_value(
-                m.REMEDIATION_OUTCOMES,
-                alert_type="BucketAlert",
-                outcome="success",
-                attempts=str(n),
-            )
+            integer_series = _outcome_value("BucketAlert", "success", str(n))
             assert integer_series == 0.0, (
                 f"Unbounded series attempts={n!r} was created. "
                 f"`_record_outcome` must always pass through `bucket_attempts`."
@@ -265,6 +258,126 @@ class TestAttemptBucket:
             )
 
 
+class TestSanitizeErrorMessage:
+    """Pin the ``error_message`` label sanitizer.
+
+    The sanitizer bounds cardinality by folding genuinely per-instance tokens
+    (UUIDs, IPs, bare numbers, long opaque alphanumeric ids) while preserving
+    short alphanumeric tokens that carry diagnostic meaning. The regression
+    these tests guard against: an over-broad "any token with a letter and a
+    digit" fold that collapsed versions/protocols/error codes/numeronyms
+    (``v1``, ``http2``, ``error404``, ``k8s`` ...) into a single ``<id>``
+    series, erasing the distinction between unrelated error categories.
+    """
+
+    @pytest.mark.parametrize("raw", [None, "", "   ", "\t\n"])
+    def test_empty_like_maps_to_none(self, raw):
+        assert m.sanitize_error_message(raw) == m.ERROR_MESSAGE_NONE
+
+    def test_lowercased(self):
+        assert m.sanitize_error_message("TimedOut") == "timedout"
+
+    def test_uuid_folded(self):
+        out = m.sanitize_error_message(
+            "run 550e8400-e29b-41d4-a716-446655440000 failed"
+        )
+        assert out == "run <uuid> failed"
+
+    def test_ipv4_folded(self):
+        assert m.sanitize_error_message("cannot reach 10.0.0.5") == "cannot reach <ip>"
+
+    def test_bare_number_folded(self):
+        # A standalone integer is a bare number, not an opaque id.
+        assert m.sanitize_error_message("retry 42 exhausted") == "retry <num> exhausted"
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            # The user-reported false positives: versions / protocols /
+            # error codes — all short letter+digit tokens.
+            "v1",
+            "v2",
+            "http2",
+            "tls1",
+            "error404",
+            "api2",
+            "timeout2",
+            # Plus other common meaningful numeronyms / infra tokens that a
+            # naive letter+digit fold would also destroy.
+            "k8s",
+            "i18n",
+            "sha256",
+            "oauth2",
+            "p95",
+            "arm64",
+            "utf8",
+            "ec2",
+            "s3",
+        ],
+    )
+    def test_short_meaningful_alnum_preserved(self, token):
+        out = m.sanitize_error_message(f"got {token} error")
+        assert out == f"got {token} error", (
+            f"{token!r} was mangled; short letter+digit tokens carry "
+            f"diagnostic meaning and must not fold to <id>/<num>."
+        )
+        assert "<id>" not in out and "<num>" not in out
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "a1b2c3d4e5f6",  # 12 chars — the fold boundary
+            "550e8400e29b41d4a716446655440000",  # dashless UUID
+            "deadbeef1234cafe",  # hash-like
+            "obj7f3a9b2c1d0e",  # opaque object id
+        ],
+    )
+    def test_long_opaque_ids_folded(self, token):
+        out = m.sanitize_error_message(f"object {token} not found")
+        assert out == "object <id> not found", (
+            f"{token!r} is a long opaque identifier and should fold to <id> "
+            f"to keep cardinality bounded."
+        )
+
+    def test_fold_length_boundary(self):
+        """One char below the threshold is preserved; at the threshold it folds."""
+        below = "a1b2c3d4e5f"  # 11 chars
+        at = "a1b2c3d4e5f6"  # 12 chars
+        assert len(below) == m._MIN_OPAQUE_ID_LENGTH - 1
+        assert len(at) == m._MIN_OPAQUE_ID_LENGTH
+        assert m.sanitize_error_message(below) == below
+        assert m.sanitize_error_message(at) == "<id>"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            # The real, configured error_message values from config.yaml
+            # (used as job_id_mappings keys) must pass through untouched
+            # apart from lower-casing — they are the whole reason the label
+            # is meaningful.
+            "Data-collection-vendor-is-down",
+            "Data-collection-got-rate-limit-error",
+            "Active-dataflow-is-not-running-or-failed",
+            "Unknown-error-type",
+        ],
+    )
+    def test_real_config_values_only_lowercased(self, raw):
+        out = m.sanitize_error_message(raw)
+        assert out == raw.lower()
+        assert "<id>" not in out and "<num>" not in out
+
+    def test_idempotent(self):
+        raw = "object a1b2c3d4e5f6 on 10.0.0.5 retry 3"
+        once = m.sanitize_error_message(raw)
+        twice = m.sanitize_error_message(once)
+        assert once == twice
+
+    def test_truncated_to_max_length(self):
+        raw = "word " * 60  # ~300 chars pre-collapse
+        out = m.sanitize_error_message(raw)
+        assert len(out) <= m._MAX_ERROR_MESSAGE_LENGTH
+
+
 class TestTerminalRecording:
     def test_terminal_records_outcome_and_duration(self):
         manager = _make_manager()
@@ -276,24 +389,14 @@ class TestTerminalRecording:
             attempts=2,
         )
 
-        before = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="DurationAlert",
-            outcome="success",
-            attempts="2",
-        )
+        before = _outcome_value("DurationAlert", "success", "2")
         hist_before = m.REMEDIATION_DURATION.labels(
             alert_type="DurationAlert", outcome="success"
         )._sum.get()  # type: ignore[attr-defined]
 
         manager._record_terminal(wf, "success")
 
-        after = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="DurationAlert",
-            outcome="success",
-            attempts="2",
-        )
+        after = _outcome_value("DurationAlert", "success", "2")
         hist_after = m.REMEDIATION_DURATION.labels(
             alert_type="DurationAlert", outcome="success"
         )._sum.get()  # type: ignore[attr-defined]
@@ -318,18 +421,8 @@ class TestTerminalRecording:
             attempts=1,
         )
 
-        primary_before = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="IdemAlert",
-            outcome="retrigger_failed",
-            attempts="1",
-        )
-        escalated_before = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="IdemAlert",
-            outcome="escalated",
-            attempts="1",
-        )
+        primary_before = _outcome_value("IdemAlert", "retrigger_failed", "1")
+        escalated_before = _outcome_value("IdemAlert", "escalated", "1")
         # The escalated-labelled histogram series must stay flat — a second
         # _record_terminal call would add an observation to it.
         escalated_hist_sum_before = m.REMEDIATION_DURATION.labels(
@@ -340,18 +433,8 @@ class TestTerminalRecording:
         # Simulates the outer handler firing after _escalate raised.
         manager._record_terminal(wf, "escalated")
 
-        primary_after = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="IdemAlert",
-            outcome="retrigger_failed",
-            attempts="1",
-        )
-        escalated_after = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="IdemAlert",
-            outcome="escalated",
-            attempts="1",
-        )
+        primary_after = _outcome_value("IdemAlert", "retrigger_failed", "1")
+        escalated_after = _outcome_value("IdemAlert", "escalated", "1")
         escalated_hist_sum_after = m.REMEDIATION_DURATION.labels(
             alert_type="IdemAlert", outcome="escalated"
         )._sum.get()  # type: ignore[attr-defined]
@@ -379,19 +462,9 @@ class TestTerminalRecording:
         manager._record_terminal(wf, "success")
         manager._terminal_recorded.discard(wf.id)
 
-        before = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="CleanupAlert",
-            outcome="escalated",
-            attempts="1",
-        )
+        before = _outcome_value("CleanupAlert", "escalated", "1")
         manager._record_terminal(wf, "escalated")
-        after = _counter_value(
-            m.REMEDIATION_OUTCOMES,
-            alert_type="CleanupAlert",
-            outcome="escalated",
-            attempts="1",
-        )
+        after = _outcome_value("CleanupAlert", "escalated", "1")
         assert after == before + 1
 
 
